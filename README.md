@@ -4,15 +4,13 @@
 [![rank](https://make.fun/badge/gta6-01/wangconghua/gta6/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 [![reward](https://make.fun/badge/gta6-01/wangconghua/gta6/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
-Solmar City — an original top-down open-world crime game: explore a coastal city on foot and by car, steal cars, outrun the police, run three story missions, and save your progress.
+Palma City is a top-down open-world crime game: steal cars, outrun the Palma Bay police, and run six story jobs for Mara Voss across a sun-soaked coastal city — with traffic, pedestrians, a wanted level, shootouts, a minimap HUD and saves. It runs from static files in any desktop browser, no network needed.
 
 ## Run it
 
 ```sh
 node serve.ts
 ```
-
-Then open http://localhost:8080 in a desktop browser.
 
 ---
 

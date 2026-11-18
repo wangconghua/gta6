@@ -1,315 +1,299 @@
-// Boot and the one loop: input is read every frame, the world advances in
-// fixed 1/60 s steps, and the renderer paints what is there. The game
-// moves between six screens: title, play, paused, busted, wasted and the
-// end of the story.
-//
-// ?seed=N fixes the city. ?shot=cover|street|mission|title stages that
-// scene instead of running the loop, paints it and sets window.__shotReady
-// for a screenshot. ?test=1 runs the scripted self-checks and writes the
-// results into the page for the test runner to read.
+// Boot and the one loop: input is read every frame, the world advances in fixed
+// 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
+// paints what is there. The game moves between title, play, paused, help and
+// wasted. ?seed=N fixes the city; ?shot=chase|street|fight|beach (with &seed=N)
+// stages that scene instead of running the loop, paints it and sets
+// window.__shotReady for a screenshot.
 
-import { FONT } from './config.js';
+import { MONEY, STEP } from './config.js';
+import { createCity, PLACES } from './city.js';
 import { makeRng } from './random.js';
-import { createState, addToast, advanceDialogue, stepGame } from './game.js';
-import { carXY } from './entities.js';
-import { enterCar } from './player.js';
-import { attachInput, endFrameInput, makeInput } from './input.js';
-import { makeAudio, playSound, toggleMute, unlockAudio, updateEngine, updateMusic, updateSiren } from './audio.js';
-import { SCREEN_BUSTED, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_STORY, SCREEN_TITLE, SCREEN_WASTED, makeCamera, render, updateCamera } from './render.js';
+import { createAudio } from './audio.js';
+import { ACTION_ACCEPT, ACTION_ENTER, ACTION_MUTE, ACTION_PAUSE, ACTION_RELOAD, ACTION_SAVE, createInput } from './input.js';
+import { createPlayer, enterCar, exitCar, nearestCar, startReload, updateAim, updatePlayerOnFoot } from './player.js';
+import { populateWorld, updateEntities } from './entities.js';
+import { startMission, updateMission } from './missions.js';
+import { loadSave, saveGame as persistSave } from './save.js';
+import { createRenderer, SCREEN_HELP, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WASTED } from './render.js';
 import { stageShot } from './shots.js';
-import { clearSave, readSave, writeSave } from './save.js';
-import { startMission } from './missions.js';
 
-const STEP = 1 / 60;
+/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+/** How close the player must drive to Lou's Spray Shop to get a fresh paint job. */
+const SPRAY_RADIUS = 110;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
-const testMode = params.get('test') === '1';
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : 20261117;
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
 
 const canvas = document.getElementById('game');
-const statusEl = document.getElementById('status');
-const state = createState(seed);
-state.camera = makeCamera();
-state.save = readSave();
-const input = makeInput();
-attachInput(input, canvas);
-const audio = makeAudio();
+const status = document.getElementById('status');
+const renderer = createRenderer(canvas);
+const input = createInput(canvas);
+const audio = createAudio();
 
-let screen = SCREEN_TITLE;
-let menuAction = null;
-
-function setScreen(next) {
-  screen = next;
-  if (statusEl) {
-    statusEl.textContent = next === SCREEN_PLAY ? 'Playing Solmar City' : next;
+/** Build a fresh game: the city, the player at the safehouse, the traffic and the crowd. */
+function createGame() {
+  const rng = makeRng(seed);
+  const city = createCity(seed);
+  const G = {
+    seed, rng, city, time: 0, screen: SCREEN_TITLE,
+    player: createPlayer(PLACES.safehouse.x, PLACES.safehouse.y + 130),
+    playerCar: null, cars: [], peds: [], bullets: [], particles: [], pickups: [],
+    wanted: { stars: 0, lastCrime: -999, quietTimer: 0, spawnTimer: 0 },
+    mission: null, briefing: null, toasts: [],
+    money: MONEY.start, stats: { missionsDone: 0, kills: 0, carsStolen: 0 },
+    camera: { x: 0, y: 0, sx: 0, sy: 0 },
+    attract: { x: 1300, y: 1300, angle: 0 },
+    shake: 0, hoverButton: null,
+    saveMoney: 0, saveMissions: 0,
+    input, audio,
+    toast(text) {
+      this.toasts.push({ text, timer: 4 });
+      if (this.toasts.length > 4) this.toasts.shift();
+    },
+    saveGame() {
+      const ok = persistSave(this);
+      if (ok) this.toast('Game saved.');
+      return ok;
+    },
+  };
+  populateWorld(G);
+  const save = loadSave();
+  if (save) {
+    G.saveMoney = save.money;
+    G.saveMissions = save.missionsDone;
   }
+  return G;
 }
 
-function startNewGame() {
-  const fresh = createState(state.seed);
-  Object.assign(state, fresh);
-  state.camera = makeCamera();
-  state.save = readSave();
-  startMission(state.missions, state);
-  advanceDialogue(state);
-  setScreen(SCREEN_PLAY);
+const G = createGame();
+
+/** One fixed step of the live game (also what the screenshot scenes drive). */
+function stepGame(dt) {
+  G.time += dt;
+  if (G.briefing) {
+    G.briefing.timer -= dt;
+    if (G.briefing.timer <= 0) G.briefing = null;
+  }
+  for (let i = G.toasts.length - 1; i >= 0; i -= 1) {
+    G.toasts[i].timer -= dt;
+    if (G.toasts[i].timer <= 0) G.toasts.splice(i, 1);
+  }
+  const mouse = input.mouse();
+  updateAim(G, mouse, G.camera, renderer.view);
+  // A scripted aim (the fight screenshot) overrides the mouse.
+  if (G.aimTarget) {
+    G.player.aimAngle = Math.atan2(G.aimTarget.y - G.player.y, G.aimTarget.x - G.player.x);
+  }
+  if (G.playerCar) {
+    // Driving is advanced inside updateEntities, from the same held keys.
+    if (G.player.invulnerable > 0) G.player.invulnerable -= dt;
+  } else {
+    updatePlayerOnFoot(G, input, dt);
+  }
+  updateEntities(G, dt);
+  updateMission(G, dt);
+  // Lou's Spray Shop: drive in with heat and $200, drive out clean.
+  if (G.playerCar && G.wanted.stars > 0 && G.money >= MONEY.sprayCost
+    && Math.hypot(G.player.x - PLACES.spray.x, G.player.y - PLACES.spray.y) < SPRAY_RADIUS) {
+    G.money -= MONEY.sprayCost;
+    G.wanted.stars = 0;
+    G.wanted.quietTimer = 0;
+    G.toast("Fresh paint at Lou's — the heat is gone. -$200.");
+    audio.cash();
+  }
+  audio.setEngine(G.playerCar ? Math.min(1, Math.hypot(G.playerCar.vx, G.playerCar.vy) / 320) : 0);
+}
+
+G.step = stepGame;
+
+function announce(message) {
+  status.textContent = message;
+}
+
+function newGame() {
+  const fresh = createGame();
+  Object.keys(fresh).forEach((key) => { G[key] = fresh[key]; });
+  G.screen = SCREEN_PLAY;
+  G.money = MONEY.start;
+  startMission(G, 0);
+  announce('Palma City. Mission 1: Wheels Up. Steal a car and bring it to Mara\'s Garage.');
 }
 
 function continueGame() {
-  const save = state.save;
+  const save = loadSave();
   if (!save) return;
-  state.player.cash = save.cash || 0;
-  state.player.x = save.x || state.player.x;
-  state.player.y = save.y || state.player.y;
-  state.missions.index = save.missionIndex || 0;
-  state.packagesFound = save.packages || 0;
-  setScreen(SCREEN_PLAY);
+  const fresh = createGame();
+  Object.keys(fresh).forEach((key) => { G[key] = fresh[key]; });
+  G.screen = SCREEN_PLAY;
+  G.money = save.money;
+  G.stats.missionsDone = save.missionsDone;
+  G.stats.kills = save.kills;
+  G.stats.carsStolen = save.carsStolen;
+  G.player.x = save.player.x;
+  G.player.y = save.player.y;
+  G.player.hp = save.player.hp;
+  G.player.ammo = save.player.ammo;
+  G.player.ammoReserve = save.player.ammoReserve;
+  G.time = save.playTime;
+  if (save.missionIndex >= 6) {
+    G.mission = { index: 6, done: true, stage: 0, timer: 0, hold: 0, killsDone: 0 };
+  } else {
+    startMission(G, save.missionIndex);
+  }
+  announce('Welcome back to Palma City.');
 }
 
-function startRoam() {
-  state.missions.index = 3;
-  state.missions.done = true;
-  setScreen(SCREEN_PLAY);
+function respawn() {
+  G.money = Math.max(0, G.money - MONEY.hospitalFee);
+  G.player.hp = 100;
+  G.player.x = PLACES.hospital.x;
+  G.player.y = PLACES.hospital.y + 120;
+  G.player.ammo = 12;
+  G.player.ammoReserve = Math.max(G.player.ammoReserve, 24);
+  G.wanted.stars = 0;
+  G.playerCar = null;
+  G.player.onFoot = true;
+  G.screen = SCREEN_PLAY;
+  G.toast('You wake up at Palma General. -$100.');
+  announce('Back on the streets.');
 }
 
-function respawnAt(spotsKey) {
-  const spot = state.city.spots[spotsKey];
-  state.player.x = spot.x;
-  state.player.y = spot.y + 50;
-  state.player.car = null;
-  state.player.health = 100;
-  state.player.wasted = false;
-  state.wanted = 0;
-  state.cops.length = 0;
-  state.copCars.length = 0;
-  state.bullets.length = 0;
-  setScreen(SCREEN_PLAY);
+/** Which menu button, if any, is under the mouse right now. */
+function buttonUnderMouse() {
+  const mouse = input.mouse();
+  for (const b of renderer.buttons()) {
+    if (mouse.x >= b.x && mouse.x <= b.x + b.w && mouse.y >= b.y && mouse.y <= b.y + b.h) return b.id;
+  }
+  return null;
 }
 
-function handleFiredEvents(fired) {
-  for (const ev of fired) {
-    switch (ev.type) {
-      case 'shoot': playSound(audio, 'shoot'); break;
-      case 'copShoot': playSound(audio, 'copShoot'); break;
-      case 'crash': playSound(audio, 'crash'); break;
-      case 'reload': playSound(audio, 'reload'); break;
-      case 'dryfire': playSound(audio, 'dryfire'); break;
-      case 'enter': case 'steal': playSound(audio, 'enter'); break;
-      case 'package': case 'stepDone': playSound(audio, 'pickup'); break;
-      case 'missionComplete':
-        playSound(audio, 'mission');
-        writeSave(state);
-        if (state.missions.done) setScreen(SCREEN_STORY);
-        break;
-      case 'busted':
-        playSound(audio, 'busted');
-        state.player.cash = Math.max(0, state.player.cash - 200);
-        setScreen(SCREEN_BUSTED);
-        break;
-      case 'wasted':
-        playSound(audio, 'wasted');
-        setScreen(SCREEN_WASTED);
-        break;
-      default: break;
+function handleMenuAction(id) {
+  if (G.screen === SCREEN_TITLE) {
+    if (id === 'new') newGame();
+    else if (id === 'continue') continueGame();
+    else if (id === 'help') G.screen = SCREEN_HELP;
+  } else if (G.screen === SCREEN_HELP) {
+    if (id === 'back') G.screen = G.returnScreen ?? SCREEN_TITLE;
+  } else if (G.screen === SCREEN_PAUSED) {
+    if (id === 'resume') G.screen = SCREEN_PLAY;
+    else if (id === 'save') G.saveGame();
+    else if (id === 'help') {
+      G.returnScreen = SCREEN_PAUSED;
+      G.screen = SCREEN_HELP;
+    } else if (id === 'quit') G.screen = SCREEN_TITLE;
+  } else if (G.screen === SCREEN_WASTED) {
+    if (id === 'respawn') respawn();
+  }
+}
+
+function handleActions() {
+  const actions = input.takeActions();
+  if (actions & ACTION_MUTE) {
+    const muted = audio.toggleMute();
+    G.toast(muted ? 'Sound off.' : 'Sound on.');
+  }
+  if (G.screen === SCREEN_TITLE || G.screen === SCREEN_HELP || G.screen === SCREEN_PAUSED || G.screen === SCREEN_WASTED) {
+    if (actions & ACTION_ACCEPT) {
+      const id = buttonUnderMouse();
+      if (id) handleMenuAction(id);
+      else if (G.screen === SCREEN_TITLE) newGame();
+      else if (G.screen === SCREEN_WASTED) respawn();
+      else if (G.screen === SCREEN_PAUSED) G.screen = SCREEN_PLAY;
+    }
+    if (actions & ACTION_PAUSE && G.screen === SCREEN_PAUSED) G.screen = SCREEN_PLAY;
+    return;
+  }
+  // Playing.
+  if (actions & ACTION_PAUSE) {
+    G.screen = SCREEN_PAUSED;
+    announce('Paused.');
+    return;
+  }
+  if (actions & ACTION_SAVE) {
+    G.saveGame();
+    return;
+  }
+  if (actions & ACTION_ENTER) {
+    if (G.playerCar) exitCar(G);
+    else {
+      const car = nearestCar(G);
+      if (car) enterCar(G, car);
     }
   }
-  if (state.player.health <= 0 && screen === SCREEN_PLAY) {
-    state.player.health = 0;
-    state.player.cash = Math.floor(state.player.cash * 0.9);
-    playSound(audio, 'wasted');
-    setScreen(SCREEN_WASTED);
-  }
+  if (actions & ACTION_RELOAD) startReload(G);
 }
 
-function titleClick(mx, my) {
-  for (const item of state.menuItems || []) {
-    if (mx >= 1280 / 2 - 230 && mx <= 1280 / 2 + 230 && my >= item.y && my <= item.y + item.h) {
-      menuAction = item.action;
-      return;
-    }
+function runShot(name) {
+  stageShot(name, G);
+  // Snap the camera onto the player so the first painted frame is the scene.
+  const vw = renderer.view.cssW / renderer.view.scale;
+  const vh = renderer.view.cssH / renderer.view.scale;
+  G.camera.x = Math.max(0, Math.min(Math.max(0, 2600 - vw), G.player.x - vw / 2));
+  G.camera.y = Math.max(0, Math.min(Math.max(0, 2600 - vh), G.player.y - vh / 2));
+  let painted = 0;
+  function paint() {
+    renderer.draw(G, G.screen, loadSave() !== null);
+    painted += 1;
+    if (painted < 2) requestAnimationFrame(paint);
+    else window.__shotReady = true;
   }
+  requestAnimationFrame(paint);
 }
 
-canvas.addEventListener('click', () => {
-  unlockAudio(audio);
-  if (screen === SCREEN_TITLE) titleClick(input.mouseX, input.mouseY);
-});
+function runGame() {
+  let accumulator = 0;
+  let last = performance.now();
 
-let lastTime = 0;
-function frame(time) {
-  const dt = Math.min(MAX_FRAME, (time - lastTime) / 1000 || STEP);
-  lastTime = time;
-  const t = time / 1000;
-
-  if (input.mute) toggleMute(audio);
-  if (screen === SCREEN_TITLE) {
-    if (input.anyKey) unlockAudio(audio);
-    // Keyboard menu: 1 start, 2 continue, 3 free roam.
-    if (input.enterPressed) menuAction = 'start';
-    const pressed = window.__pressedKeys;
-    if (pressed && pressed.has('Digit1')) menuAction = 'start';
-    if (pressed && pressed.has('Digit2') && state.save) menuAction = 'continue';
-    if (pressed && pressed.has('Digit3')) menuAction = 'roam';
-    if (menuAction === 'start') startNewGame();
-    else if (menuAction === 'continue') continueGame();
-    else if (menuAction === 'roam') startRoam();
-    menuAction = null;
-    // Hover highlight for the menu buttons.
-    state.menuHover = null;
-    for (const item of state.menuItems || []) {
-      if (input.mouseX >= 410 && input.mouseX <= 870 && input.mouseY >= item.y && input.mouseY <= item.y + item.h) {
-        state.menuHover = item.action;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    last = now;
+    handleActions();
+    // Hover state for the menu buttons.
+    G.hoverButton = (G.screen === SCREEN_TITLE || G.screen === SCREEN_HELP || G.screen === SCREEN_PAUSED || G.screen === SCREEN_WASTED)
+      ? buttonUnderMouse()
+      : null;
+    if (G.screen === SCREEN_TITLE) {
+      // Attract mode: drift the camera over downtown while traffic moves.
+      G.attract.angle += 0.0004;
+      G.attract.x = 1300 + Math.cos(G.attract.angle) * 260;
+      G.attract.y = 1300 + Math.sin(G.attract.angle * 0.7) * 200;
+      while (accumulator >= STEP) {
+        G.time += STEP;
+        updateEntities(G, STEP);
+        accumulator -= STEP;
       }
-    }
-    updateCamera(state.camera, state, dt);
-    render(canvas.getContext('2d'), state, SCREEN_TITLE, t);
-  } else if (screen === SCREEN_PLAY) {
-    // Dialogue first: E or click advances it, the world waits.
-    if (state.dialogueLine && (input.interactPressed || input.enterPressed)) {
-      advanceDialogue(state);
-      endFrameInput(input);
-      render(canvas.getContext('2d'), state, SCREEN_PLAY, t);
-      requestAnimationFrame(frame);
-      return;
-    }
-    if (input.pause) {
-      setScreen(SCREEN_PAUSED);
+    } else if (G.screen === SCREEN_PLAY) {
+      while (accumulator >= STEP) {
+        stepGame(STEP);
+        accumulator -= STEP;
+        if (G.screen !== SCREEN_PLAY) break;
+      }
     } else {
-      let remaining = dt;
-      while (remaining > 0) {
-        const step = Math.min(STEP, remaining);
-        const fired = stepGame(state, input, step);
-        handleFiredEvents(fired);
-        remaining -= step;
-        if (screen !== SCREEN_PLAY) break;
-      }
-      updateCamera(state.camera, state, dt);
-      updateSiren(audio, state.copCars.length > 0);
-      updateEngine(audio, state.player.car ? Math.abs(state.player.car.speed) / 560 : 0);
-      updateMusic(audio, dt, true);
+      accumulator = 0;
     }
-    render(canvas.getContext('2d'), state, SCREEN_PLAY, t);
-  } else if (screen === SCREEN_PAUSED) {
-    if (input.pause) setScreen(SCREEN_PLAY);
-    if (window.__pressedKeys && window.__pressedKeys.has('KeyS')) writeSave(state);
-    if (window.__pressedKeys && window.__pressedKeys.has('KeyQ')) { state.save = readSave(); setScreen(SCREEN_TITLE); }
-    render(canvas.getContext('2d'), state, SCREEN_PAUSED, t);
-  } else if (screen === SCREEN_BUSTED || screen === SCREEN_WASTED) {
-    if (input.enterPressed || input.interactPressed) {
-      respawnAt(screen === SCREEN_BUSTED ? 'police' : 'hospital');
-    }
-    render(canvas.getContext('2d'), state, screen, t);
-  } else if (screen === SCREEN_STORY) {
-    if (input.enterPressed || input.interactPressed) setScreen(SCREEN_PLAY);
-    render(canvas.getContext('2d'), state, SCREEN_STORY, t);
+    const save = loadSave();
+    renderer.draw(G, G.screen, save !== null);
   }
 
-  endFrameInput(input);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && G.screen === SCREEN_PLAY) {
+      G.screen = SCREEN_PAUSED;
+      announce('Paused.');
+    }
+  });
+  window.addEventListener('pointerdown', () => audio.unlock(), { once: true });
+  window.addEventListener('keydown', () => audio.unlock(), { once: true });
+
+  announce('Palma City. Press Enter or click to start.');
   requestAnimationFrame(frame);
 }
 
-// Track raw key codes for the menu shortcuts (1/2/3, S, Q).
-window.__pressedKeys = new Set();
-window.addEventListener('keydown', (e) => window.__pressedKeys.add(e.code));
-window.addEventListener('keyup', (e) => window.__pressedKeys.delete(e.code));
+// For play-testing and screenshots: the whole game, inspectable from the console.
+window.PALMA = G;
 
-function runSelfTests() {
-  const results = [];
-  const check = (name, ok, detail) => results.push({ name, ok: !!ok, detail: detail || '' });
-  const ctx = canvas.getContext('2d');
-
-  // 1. The player walks: on an avenue, holding up for a second moves north.
-  state.player.x = 520;
-  state.player.y = 520;
-  state.player.car = null;
-  const y0 = state.player.y;
-  for (let i = 0; i < 60; i += 1) stepGame(state, { ...input, up: true }, STEP);
-  check('walk', state.player.y < y0 - 50, 'y ' + y0.toFixed(0) + ' -> ' + state.player.y.toFixed(0));
-
-  // 2. Getting into a parked car works.
-  const parked = state.cars[0];
-  state.player.x = parked.x + 10;
-  state.player.y = parked.y + 10;
-  stepGame(state, { ...input, enterPressed: true }, STEP);
-  check('enterCar', state.player.car === parked, state.player.car ? 'in car' : 'still on foot');
-
-  // 3. Driving: gas for two seconds builds speed and moves the car.
-  const cx0 = parked.x;
-  const cy0 = parked.y;
-  for (let i = 0; i < 120; i += 1) stepGame(state, { ...input, up: true }, STEP);
-  const moved = Math.abs(parked.x - cx0) + Math.abs(parked.y - cy0);
-  check('drive', Math.abs(parked.speed) > 100 && moved > 50, 'speed ' + parked.speed.toFixed(0) + ' moved ' + moved.toFixed(0));
-
-  // 4. Shooting fires a bullet and spends ammo.
-  const ammo0 = state.player.ammo;
-  state.player.car = null;
-  state.player.x = 1200;
-  state.player.y = 600;
-  state.player.aimAngle = 0;
-  stepGame(state, { ...input, shoot: true }, STEP);
-  check('shoot', state.bullets.length >= 1 && state.player.ammo === ammo0 - 1, 'bullets ' + state.bullets.length + ' ammo ' + state.player.ammo);
-
-  // 5. The first mission advances when Jay reaches the warehouse.
-  startMission(state.missions, state);
-  const spot = state.city.spots.warehouse;
-  state.player.x = spot.x;
-  state.player.y = spot.y;
-  for (let i = 0; i < 5; i += 1) stepGame(state, { ...input }, STEP);
-  check('mission', state.missions.step >= 1, 'step ' + state.missions.step);
-
-  // 6. Stealing a traffic car raises the wanted level.
-  const w0 = state.wanted;
-  const t = state.traffic[0];
-  const tp = carXY(t);
-  state.player.car = null;
-  state.player.x = tp.x;
-  state.player.y = tp.y;
-  enterCar(state, { traffic: t, x: tp.x, y: tp.y });
-  stepGame(state, { ...input }, STEP);
-  check('wanted', state.wanted > w0, 'wanted ' + w0 + ' -> ' + state.wanted);
-
-  // 7. Saving and loading round-trips the cash.
-  state.player.cash = 1234;
-  writeSave(state);
-  const loaded = readSave();
-  check('save', loaded && loaded.cash === 1234, loaded ? 'cash ' + loaded.cash : 'no save');
-
-  // 8. The game renders a frame without throwing.
-  let rendered = false;
-  try {
-    render(ctx, state, SCREEN_PLAY, 1.5);
-    rendered = true;
-  } catch (e) {
-    rendered = false;
-  }
-  check('render', rendered, '');
-
-  const passed = results.filter((r) => r.ok).length;
-  const summary = 'SELFTEST ' + passed + '/' + results.length + ' ' + results.map((r) => (r.ok ? 'PASS' : 'FAIL') + ':' + r.name).join(' ');
-  document.title = summary;
-  window.__testResults = results;
-  const pre = document.createElement('pre');
-  pre.id = 'test-results';
-  pre.textContent = summary + '\n' + results.map((r) => (r.ok ? 'PASS' : 'FAIL') + ' ' + r.name + ' ' + r.detail).join('\n');
-  document.body.appendChild(pre);
-  return results;
-}
-
-if (testMode) {
-  runSelfTests();
-} else if (shot) {
-  const staged = stageShot(shot, state);
-  const ctx = canvas.getContext('2d');
-  updateCamera(state.camera, state, 0.1);
-  render(ctx, state, staged === 'title' ? SCREEN_TITLE : SCREEN_PLAY, 2.0);
-  render(ctx, state, staged === 'title' ? SCREEN_TITLE : SCREEN_PLAY, 2.0);
-  window.__shotReady = true;
-} else {
-  // A slow pan across the city behind the title screen.
-  state.camera.x = 600;
-  state.camera.y = 300;
-  requestAnimationFrame(frame);
-}
+if (shot) runShot(shot);
+else runGame();

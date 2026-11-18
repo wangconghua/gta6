@@ -1,80 +1,86 @@
-// Keyboard and mouse state, read fresh every frame. The game asks this
-// module what is held down; it never touches DOM events itself.
+// Keyboard and pointer input. Held keys are read every step; one-shot presses
+// (enter car, shoot is held, pause, reload, mission accept) are queued as bit flags
+// and taken once by the loop, so a press between two frames is never lost or counted twice.
 
-import { KEYS } from './config.js';
+export const ACTION_ENTER = 1; // E: get in / out of a car
+export const ACTION_PAUSE = 2; // P or Escape
+export const ACTION_RELOAD = 4; // R
+export const ACTION_ACCEPT = 8; // Enter / Space on menus and briefings
+export const ACTION_MUTE = 16; // M
+export const ACTION_SAVE = 32; // F5 is the browser's; use Q to quick-save in pause
 
-export function makeInput() {
-  return {
-    up: false, down: false, left: false, right: false,
-    run: false, shoot: false, spaceShoot: false,
-    reload: false, pause: false, mute: false,
-    enterPressed: false, interactPressed: false,
-    mouseX: 640, mouseY: 360, mouseDown: false,
-    anyKey: false,
-  };
-}
+const KEYS = {
+  KeyW: 'up', ArrowUp: 'up',
+  KeyS: 'down', ArrowDown: 'down',
+  KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right',
+  ShiftLeft: 'run', ShiftRight: 'run',
+};
 
-function has(list, code) {
-  return list.indexOf(code) !== -1;
-}
+export function createInput(canvas) {
+  const held = { up: false, down: false, left: false, right: false, run: false, fire: false };
+  let actions = 0;
+  let mouseX = 0;
+  let mouseY = 0;
+  let mouseDown = false;
 
-export function attachInput(input, canvas) {
-  const down = (e) => {
-    input.anyKey = true;
-    if (has(KEYS.up, e.code)) input.up = true;
-    if (has(KEYS.down, e.code)) input.down = true;
-    if (has(KEYS.left, e.code)) input.left = true;
-    if (has(KEYS.right, e.code)) input.right = true;
-    if (has(KEYS.run, e.code)) input.run = true;
-    if (has(KEYS.reload, e.code)) input.reload = true;
-    if (has(KEYS.pause, e.code)) input.pause = true;
-    if (has(KEYS.mute, e.code)) input.mute = true;
-    if (has(KEYS.enterCar, e.code)) input.enterPressed = true;
-    if (e.code === 'Space') {
-      input.spaceShoot = true;
-      input.interactPressed = true;
-      e.preventDefault();
+  window.addEventListener('keydown', (event) => {
+    const name = KEYS[event.code];
+    if (name) {
+      held[name] = true;
+      event.preventDefault();
+      return;
     }
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].indexOf(e.code) !== -1) e.preventDefault();
-  };
-  const up = (e) => {
-    if (has(KEYS.up, e.code)) input.up = false;
-    if (has(KEYS.down, e.code)) input.down = false;
-    if (has(KEYS.left, e.code)) input.left = false;
-    if (has(KEYS.right, e.code)) input.right = false;
-    if (has(KEYS.run, e.code)) input.run = false;
-    if (has(KEYS.reload, e.code)) input.reload = false;
-    if (has(KEYS.pause, e.code)) input.pause = false;
-    if (has(KEYS.mute, e.code)) input.mute = false;
-    if (e.code === 'Space') input.spaceShoot = false;
-  };
-  window.addEventListener('keydown', down);
-  window.addEventListener('keyup', up);
-  canvas.addEventListener('mousemove', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    input.mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
-    input.mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+    if (event.repeat) return;
+    if (event.code === 'KeyE') actions |= ACTION_ENTER;
+    else if (event.code === 'KeyP' || event.code === 'Escape') actions |= ACTION_PAUSE;
+    else if (event.code === 'KeyR') actions |= ACTION_RELOAD;
+    else if (event.code === 'Enter' || event.code === 'Space') actions |= ACTION_ACCEPT;
+    else if (event.code === 'KeyM') actions |= ACTION_MUTE;
+    else if (event.code === 'KeyQ') actions |= ACTION_SAVE;
+    else return;
+    event.preventDefault();
   });
-  canvas.addEventListener('mousedown', (e) => {
-    input.mouseDown = true;
-    input.shoot = true;
-    input.interactPressed = true;
-    const rect = canvas.getBoundingClientRect();
-    input.mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
-    input.mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+  window.addEventListener('keyup', (event) => {
+    const name = KEYS[event.code];
+    if (name) held[name] = false;
   });
-  window.addEventListener('mouseup', () => {
-    input.mouseDown = false;
-    input.shoot = false;
+  window.addEventListener('blur', () => {
+    for (const key of Object.keys(held)) held[key] = false;
+    mouseDown = false;
   });
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-}
 
-// Clear the one-frame presses after the game has read them.
-export function endFrameInput(input) {
-  input.enterPressed = false;
-  input.interactPressed = false;
-  input.pause = false;
-  input.mute = false;
-  input.reload = false;
+  canvas.addEventListener('pointermove', (event) => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = event.clientX - rect.left;
+    mouseY = event.clientY - rect.top;
+  });
+  canvas.addEventListener('pointerdown', (event) => {
+    if (event.button === 0) {
+      mouseDown = true;
+      held.fire = true;
+      actions |= ACTION_ACCEPT; // clicking also starts from menus
+    }
+  });
+  window.addEventListener('pointerup', (event) => {
+    if (event.button === 0) {
+      mouseDown = false;
+      held.fire = false;
+    }
+  });
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+
+  return {
+    held,
+    /** The one-shot presses since the last call, as ACTION_* flags. */
+    takeActions() {
+      const taken = actions;
+      actions = 0;
+      return taken;
+    },
+    /** Mouse position in CSS pixels relative to the canvas. */
+    mouse() {
+      return { x: mouseX, y: mouseY, down: mouseDown };
+    },
+  };
 }

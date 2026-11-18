@@ -1,192 +1,172 @@
-// The story: Jay Rook, a wheelman new to Solmar City, works three jobs for
-// Sal Moretti and ends up robbing the Solmar Bank. Each mission is a chain
-// of steps — go somewhere, pick something up, lose the cops — with a marker
-// on the map and a line of dialogue to carry it.
+// The story: six jobs for Mara Voss, who runs Palma Bay's west-side garage and
+// wants the Kessler crew pushed out. Each mission is a small state machine with
+// stages, a map target and a payout; the chain advances on its own and the
+// player is always told what to do next.
 
-import { MISSION_REWARDS } from './config.js';
-import { dist } from './random.js';
+import { PLACES } from './city.js';
+import { addWanted, spawnGang } from './entities.js';
 
-export const MISSION_NAMES = [
-  '1 · The Pickup',
-  '2 · Hot Wheels',
-  '3 · The Big Score',
+export const MISSIONS = [
+  {
+    id: 'wheels',
+    title: 'Wheels Up',
+    reward: 300,
+    brief: 'Mara Voss needs a driver. Steal any car off the street and bring it to her garage.',
+  },
+  {
+    id: 'pickup',
+    title: 'The Pickup',
+    reward: 500,
+    brief: 'A crate is waiting at the Marina Docks. Grab it and bring it back to the garage. No questions.',
+  },
+  {
+    id: 'heat',
+    title: 'Hot Pursuit',
+    reward: 400,
+    brief: 'The cops saw too much. Lose the heat — get your wanted level down to zero.',
+  },
+  {
+    id: 'muscle',
+    title: 'Muscle Work',
+    reward: 800,
+    brief: 'Kessler\'s boys are muscling in on the turf at Sun Plaza. Put all four of them down.',
+  },
+  {
+    id: 'getaway',
+    title: 'Getaway',
+    reward: 1000,
+    brief: 'The job went loud. Get across town to the Marina Docks in 75 seconds with the cops on you.',
+  },
+  {
+    id: 'score',
+    title: 'The Big Score',
+    reward: 2500,
+    brief: 'Palma Bank, midday. Hold the vault for 8 seconds, then lose a four-star wanted level at the safehouse.',
+  },
 ];
 
-// Dialogue is a queue of {who, text}; the game shows one line at a time.
-function say(who, text) {
-  return { who, text };
+/** The current objective's map target, or null when the job is "do it anywhere". */
+export function missionTarget(G) {
+  const m = G.mission;
+  if (!m || m.done) return null;
+  const def = MISSIONS[m.index];
+  if (!def) return null;
+  if (def.id === 'wheels') return m.stage === 0 ? null : { x: PLACES.garage.x, y: PLACES.garage.y, label: "Mara's Garage" };
+  if (def.id === 'pickup') return m.stage === 0 ? { x: PLACES.docks.x, y: PLACES.docks.y, label: 'Marina Docks' } : { x: PLACES.garage.x, y: PLACES.garage.y, label: "Mara's Garage" };
+  if (def.id === 'heat') return null;
+  if (def.id === 'muscle') return { x: PLACES.turf.x, y: PLACES.turf.y, label: 'Kessler Turf' };
+  if (def.id === 'getaway') return { x: PLACES.docks.x, y: PLACES.docks.y, label: 'Marina Docks' };
+  if (def.id === 'score') return m.stage === 0 ? { x: PLACES.bank.x, y: PLACES.bank.y, label: 'Palma Bank' } : { x: PLACES.safehouse.x, y: PLACES.safehouse.y, label: 'Safehouse' };
+  return null;
 }
 
-export function makeMissionState() {
-  return {
-    index: 0, // which mission, 0..2; 3 means the story is done
-    step: 0,
-    done: false,
-    timer: 0,
-    progress: 0,
-    dialogue: [],
-    active: false,
-  };
+/** One line for the HUD: what the player should do right now. */
+export function missionObjectiveText(G) {
+  const m = G.mission;
+  if (!m) return 'Free roam — press Enter for the next job.';
+  if (m.done) return 'Story complete. Palma Bay is yours — free roam.';
+  const def = MISSIONS[m.index];
+  if (!def) return 'Next job incoming…';
+  if (def.id === 'wheels') return m.stage === 0 ? 'Steal a car (walk up to one, press E)' : 'Drive the car to Mara\'s Garage';
+  if (def.id === 'pickup') return m.stage === 0 ? 'Collect the crate at the Marina Docks' : 'Bring the crate back to the garage';
+  if (def.id === 'heat') return 'Lose the cops — wanted level to zero';
+  if (def.id === 'muscle') return `Take out Kessler's crew (${m.killsDone}/4 down)`;
+  if (def.id === 'getaway') return `Reach the Marina Docks — ${Math.max(0, Math.ceil(m.timer))}s left`;
+  if (def.id === 'score') return m.stage === 0 ? `Hold the bank vault (${Math.ceil(m.hold)}s)` : 'Escape to the Safehouse';
+  return def.title;
 }
 
-function missionSteps(m, spots) {
-  switch (m) {
-    case 0:
-      return [
-        {
-          kind: 'goto', spot: spots.warehouse, radius: 70,
-          objective: 'Pick up the package at the warehouse',
-          onArrive: () => [say('Sal', 'Good, you found it. A little something for a friend across town.'), say('Jay', 'Across town. In this traffic. Great.')],
-        },
-        {
-          kind: 'goto', spot: spots.motel, radius: 70,
-          objective: 'Deliver the package to the Seaside Motel',
-          onArrive: () => [say('Sal', 'Delivered clean. You drive like you mean it, kid.'), say('Jay', 'So what is the next job, Sal?')],
-        },
-      ];
-    case 1:
-      return [
-        {
-          kind: 'enterGoldCar', radius: 60,
-          objective: 'Steal the gold Comet GT parked downtown',
-          onArrive: () => [say('Sal', 'That Comet is worth more than my house. Take it. Quietly.'), say('Jay', 'Quietly. Sure. With the alarm screaming.')],
-        },
-        {
-          kind: 'goto', spot: spots.garage, radius: 80,
-          objective: 'Lose the cops, then deliver the Comet to the garage',
-          heat: 2,
-          onArrive: () => [say('Sal', 'Beautiful. The buyer pays double for a car this clean.'), say('Jay', 'Double? Then I want a raise.')],
-        },
-      ];
-    case 2:
-      return [
-        {
-          kind: 'goto', spot: spots.bank, radius: 70,
-          objective: 'Get to the Solmar Bank',
-          onArrive: () => [say('Jay', 'Alright. In and out, sixty seconds, no heroes.'), say('Sal', 'The vault is through the back. Go.')],
-        },
-        {
-          kind: 'hold', spot: spots.bank, radius: 60, holdSeconds: 8,
-          objective: 'Grab the cash — stay in the vault!',
-          onArrive: () => [say('Jay', 'Cash in the bag. Now the whole city is coming.'), say('Sal', 'Then drive like your life depends on it. It does.')],
-        },
-        {
-          kind: 'goto', spot: spots.safehouse, radius: 80,
-          objective: 'Escape to the safehouse',
-          heat: 3,
-          onArrive: () => [say('Sal', 'You did it, Jay. Solmar City is yours now.'), say('Jay', 'Then let us spend it before they find us.')],
-        },
-      ];
-    default:
-      return [];
+/** Start mission `index` (or finish the story when index is past the last). */
+export function startMission(G, index) {
+  if (index >= MISSIONS.length) {
+    G.mission = { index, done: true, stage: 0, timer: 0, hold: 0, killsDone: 0 };
+    G.toast('Story complete — Palma Bay is yours.');
+    return;
+  }
+  const def = MISSIONS[index];
+  G.mission = { index, done: false, stage: 0, timer: 0, hold: 0, killsDone: 0, gangSpawned: false };
+  G.briefing = { title: `Mission ${index + 1}: ${def.title}`, text: def.brief, timer: 5 };
+  G.audio.missionStart();
+  if (def.id === 'heat') addWanted(G, 2, 'The cops are onto you!');
+  if (def.id === 'getaway') {
+    G.mission.timer = 75;
+    addWanted(G, 3, 'Three stars — run!');
+  }
+  if (def.id === 'score') {
+    G.mission.hold = 8;
+    addWanted(G, 2, 'The alarm is ringing!');
   }
 }
 
-export function currentStep(missions, spots) {
-  const steps = missionSteps(missions.index, spots);
-  return steps[missions.step] || null;
+function completeMission(G) {
+  const def = MISSIONS[G.mission.index];
+  G.money += def.reward;
+  G.stats.missionsDone += 1;
+  G.toast(`Mission complete: ${def.title} — +$${def.reward}.`);
+  G.audio.missionDone();
+  G.mission = { index: G.mission.index + 1, done: false, stage: 0, timer: 0, hold: 0, killsDone: 0, gangSpawned: false, pending: 4 };
+  G.saveGame();
 }
 
-export function missionObjective(missions, spots) {
-  if (missions.index >= 3) return 'Free roam — Solmar City is yours';
-  const step = currentStep(missions, spots);
-  return step ? step.objective : '';
-}
-
-export function missionMarker(missions, spots, state) {
-  if (missions.index >= 3) return null;
-  const step = currentStep(missions, spots);
-  if (!step) return null;
-  if (step.kind === 'enterGoldCar') return { x: state.goldCar.x, y: state.goldCar.y };
-  return { x: step.spot.x, y: step.spot.y };
-}
-
-export function startMission(missions, state) {
-  missions.active = true;
-  missions.step = 0;
-  missions.timer = 0;
-  missions.progress = 0;
-  missions.dialogue = [];
-  missions.dialogue.push(say('Sal', missionIntro(missions.index)));
-  if (missions.index === 1) {
-    state.events.push({ type: 'missionStart', name: MISSION_NAMES[1] });
+/** Advance the active mission one step; returns nothing, mutates G. */
+export function updateMission(G, dt) {
+  const m = G.mission;
+  if (!m || m.done) return;
+  if (m.staged) return; // a screenshot scene holds its job still
+  if (m.pending !== undefined) {
+    m.pending -= dt;
+    if (m.pending <= 0) {
+      delete m.pending;
+      startMission(G, m.index);
+    }
+    return;
   }
-}
+  const def = MISSIONS[m.index];
+  const p = G.player;
+  const near = (place, dist) => Math.hypot(p.x - place.x, p.y - place.y) < dist;
 
-function missionIntro(index) {
-  return [
-    'Jay, I have work for you. Pick up a package at the warehouse and take it to the Seaside Motel.',
-    'A gold Comet GT is parked downtown. Steal it and bring it to my garage. The cops will not like it.',
-    'This is the big one, Jay. The Solmar Bank. Get in, grab the cash, and get to the safehouse.',
-  ][index];
-}
-
-// Advance the mission state; called every frame while a mission is active.
-export function updateMissions(state, dt) {
-  const missions = state.missions;
-  if (missions.index >= 3 || !missions.active) return;
-  const step = currentStep(missions, state.city.spots);
-  if (!step) return;
-  const p = state.player;
-
-  if (step.kind === 'goto') {
-    if (dist(p.x, p.y, step.spot.x, step.spot.y) < step.radius) {
-      advanceStep(state, step);
+  if (def.id === 'wheels') {
+    if (m.stage === 0 && G.playerCar) m.stage = 1;
+    else if (m.stage === 1 && near(PLACES.garage, 110)) completeMission(G);
+  } else if (def.id === 'pickup') {
+    if (m.stage === 0 && near(PLACES.docks, 80)) {
+      m.stage = 1;
+      G.toast('Crate collected. Get it back to the garage.');
+      G.audio.pickup();
+    } else if (m.stage === 1 && near(PLACES.garage, 110)) completeMission(G);
+  } else if (def.id === 'heat') {
+    if (G.wanted.stars === 0) completeMission(G);
+  } else if (def.id === 'muscle') {
+    if (!m.gangSpawned) {
+      for (let i = 0; i < 4; i += 1) spawnGang(G, PLACES.turf.x, PLACES.turf.y);
+      m.gangSpawned = true;
     }
-  } else if (step.kind === 'enterGoldCar') {
-    if (p.car === state.goldCar) {
-      advanceStep(state, step);
-      if (step.heat === undefined) addHeat(state, 2);
+    const alive = G.peds.filter((ped) => ped.gang && !ped.dead).length;
+    m.killsDone = 4 - alive;
+    if (alive === 0) completeMission(G);
+  } else if (def.id === 'getaway') {
+    m.timer -= dt;
+    if (near(PLACES.docks, 100)) completeMission(G);
+    else if (m.timer <= 0) {
+      G.toast('Too slow — the job is blown. Try again.');
+      G.audio.denied();
+      startMission(G, m.index);
     }
-  } else if (step.kind === 'hold') {
-    if (dist(p.x, p.y, step.spot.x, step.spot.y) < step.radius) {
-      missions.progress += dt / step.holdSeconds;
-      if (missions.progress >= 1) advanceStep(state, step);
-    } else {
-      missions.progress = Math.max(0, missions.progress - dt * 0.5);
+  } else if (def.id === 'score') {
+    if (m.stage === 0) {
+      if (near(PLACES.bank, 110)) {
+        m.hold -= dt;
+        if (m.hold <= 0) {
+          m.stage = 1;
+          addWanted(G, 2, 'Vault cracked! Four stars — run for the safehouse!');
+          G.toast('Vault cracked. Run for the safehouse!');
+        }
+      } else {
+        m.hold = 8;
+      }
+    } else if (near(PLACES.safehouse, 110)) {
+      G.wanted.stars = 0;
+      completeMission(G);
     }
   }
-}
-
-function addHeat(state, stars) {
-  state.wanted = Math.max(state.wanted, stars);
-  state.quietT = 0;
-  state.events.push({ type: 'wantedUp', stars: state.wanted });
-}
-
-function advanceStep(state, step) {
-  const missions = state.missions;
-  if (step.onArrive) missions.dialogue.push(...step.onArrive());
-  if (step.heat) addHeat(state, step.heat);
-  state.events.push({ type: 'stepDone' });
-  missions.step += 1;
-  missions.progress = 0;
-  missions.timer = 0;
-  const next = currentStep(missions, state.city.spots);
-  if (!next) {
-    // Mission complete: pay up and roll into the next one.
-    const reward = MISSION_REWARDS[`m${missions.index + 1}`] || 0;
-    state.player.cash += reward;
-    state.events.push({ type: 'missionComplete', name: MISSION_NAMES[missions.index], reward });
-    missions.index += 1;
-    missions.active = false;
-    missions.done = missions.index >= 3;
-    if (missions.index < 3) {
-      missions.dialogue.push(say('Sal', `Job done. $${reward} is yours. Come see me when you are ready for the next one.`));
-    } else {
-      missions.dialogue.push(say('Sal', 'That is the whole story, Jay. The city is yours — go enjoy it.'));
-    }
-  }
-}
-
-// The player starts the next mission by walking into the marker at Sal's garage.
-export function tryStartNextMission(state) {
-  const missions = state.missions;
-  if (missions.active || missions.index >= 3) return false;
-  const garage = state.city.spots.garage;
-  if (dist(state.player.x, state.player.y, garage.x, garage.y) < 80) {
-    startMission(missions, state);
-    return true;
-  }
-  return false;
 }

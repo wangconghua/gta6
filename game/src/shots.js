@@ -1,115 +1,180 @@
-// The screenshot scenes behind ?shot=cover|street|mission|title. Each one
-// plays the real rules forward from a fresh city for a fixed number of
-// steps — a chase, a street on foot, a mission moment — so the frame is
-// what a short game really looks like, and the same seed gives the same
-// frame. The staged state is returned ready to render.
+// The screenshot scenes behind ?shot=chase|street|fight|beach. Each one plays
+// the real rules forward from a fresh world for a fixed number of steps, steered
+// by a small autopilot (drive toward waypoints, walk toward the job, aim at the
+// nearest gang member), so the frame is what real play looks like and the same
+// seed always gives the same frame.
 
-import { AVENUES, STREETS } from './config.js';
-import { enterCar, makeCar } from './player.js';
-import { makeCopCar } from './police.js';
-import { advanceDialogue, stepGame } from './game.js';
+import { STEP } from './config.js';
+import { makeCar, spawnPoliceCar } from './entities.js';
+import { enterCar } from './player.js';
 import { startMission } from './missions.js';
-import { makeCamera, updateCamera } from './render.js';
 
-const STEP = 1 / 60;
-
-function blankInput() {
-  return {
-    up: false, down: false, left: false, right: false, run: false,
-    shoot: false, spaceShoot: false, reload: false, pause: false, mute: false,
-    enterPressed: false, interactPressed: false,
-    mouseX: 640, mouseY: 360, mouseDown: false, anyKey: false,
-  };
-}
-
-function runSteps(state, seconds, inputFn) {
-  const steps = Math.round(seconds / STEP);
-  for (let i = 0; i < steps; i += 1) {
-    const input = inputFn ? inputFn(state, i) : blankInput();
-    stepGame(state, input, STEP);
-    updateCamera(state.camera, state, STEP);
-  }
-}
-
-// Steer the driven car down its avenue: gas on, angle toward the road.
-function chasePilot(state) {
-  const car = state.player.car;
-  if (!car) return blankInput();
-  const input = blankInput();
-  input.up = true;
-  const target = Math.PI / 2; // south, down the avenue
-  let diff = target - car.angle;
+/** Steer the player's car toward `target` by setting the held keys. */
+function driveToward(G, target) {
+  const car = G.playerCar;
+  if (!car) return;
+  const dist = Math.hypot(target.x - car.x, target.y - car.y);
+  const want = Math.atan2(target.y - car.y, target.x - car.x);
+  let diff = want - car.angle;
   while (diff > Math.PI) diff -= Math.PI * 2;
   while (diff < -Math.PI) diff += Math.PI * 2;
-  // Nudge back to the centre of the avenue.
-  const laneError = car.x - AVENUES[3];
-  if (laneError > 24) diff -= 0.25;
-  if (laneError < -24) diff += 0.25;
-  if (diff > 0.06) input.right = true;
-  else if (diff < -0.06) input.left = true;
-  return input;
+  // Brake for the corner so the turn does not end in a wall — but keep enough
+  // speed that the car is still moving when the frame is taken.
+  G.input.held.up = dist > 140;
+  G.input.held.down = dist <= 140 && car.speed > 200;
+  G.input.held.left = diff < -0.08;
+  G.input.held.right = diff > 0.08;
 }
 
-function stageCover(state) {
-  // Three stars, a gold Comet GT tearing down the avenue, two cop cars
-  // on its tail, and the bank job's escape as the live objective.
-  state.missions.index = 2;
-  state.missions.step = 2;
-  state.missions.active = true;
-  state.wanted = 3;
-  const car = makeCar(AVENUES[3], 560, Math.PI / 2, '#f5c542', { gold: true });
-  car.speed = 430;
-  state.cars.push(car);
-  state.player.x = car.x;
-  state.player.y = car.y;
-  state.player.car = car;
-  state.player.angle = Math.PI / 2;
-  state.copCars.push(makeCopCar(state, AVENUES[3] - 4, 380));
-  state.copCars.push(makeCopCar(state, AVENUES[3] + 20, 460));
-  state.copCars[0].angle = Math.PI / 2;
-  state.copCars[0].speed = 380;
-  state.copCars[1].angle = Math.PI / 2;
-  state.copCars[1].speed = 360;
-  runSteps(state, 1.8, chasePilot);
-  return 'play';
+/** Walk on foot toward `target`. */
+function walkToward(G, target) {
+  const p = G.player;
+  const dx = target.x - p.x;
+  const dy = target.y - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  G.input.held.up = dy < -len * 0.3;
+  G.input.held.down = dy > len * 0.3;
+  G.input.held.left = dx < -len * 0.3;
+  G.input.held.right = dx > len * 0.3;
 }
 
-function stageStreet(state) {
-  // On foot at a downtown intersection, traffic rolling past, pedestrians
-  // on the sidewalks, the first job waiting at the warehouse.
-  state.player.x = AVENUES[2] + 60;
-  state.player.y = STREETS[1] - 60;
-  state.player.angle = Math.PI / 4;
-  startMission(state.missions, state);
-  advanceDialogue(state);
-  runSteps(state, 2.5, null);
-  state.dialogueLine = null;
-  return 'play';
+/** Run `seconds` of fixed steps with `pilot` steering each step. */
+function simulate(G, seconds, pilot) {
+  G.player.invulnerable = 9999; // the staged player does not die mid-scene
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) {
+    pilot(i);
+    G.step(STEP);
+  }
+  G.input.held.up = false;
+  G.input.held.down = false;
+  G.input.held.left = false;
+  G.input.held.right = false;
+  G.input.held.fire = false;
 }
 
-function stageMission(state) {
-  // At the warehouse door, Sal's line on screen, the package marker lit.
-  const spot = state.city.spots.warehouse;
-  state.player.x = spot.x;
-  state.player.y = spot.y + 46;
-  state.player.angle = -Math.PI / 2;
-  startMission(state.missions, state);
-  advanceDialogue(state);
-  runSteps(state, 0.8, null);
-  return 'play';
+function finishStaging(G) {
+  G.player.hp = 100;
+  G.player.invulnerable = 0;
+  G.player.ammo = 12;
+  G.briefing = null;
+  G.aimTarget = null;
+  G.toasts.length = 0;
+  G.screen = 'play';
+}
+
+/** A sports car, the player at the wheel, three stars and police behind. */
+function stageChase(G) {
+  const car = makeCar(500, 1140, 0, 6, 'parked');
+  car.color = '#e2574c';
+  car.hp = 250; // the hero car survives the staged chase
+  G.cars.push(car);
+  G.player.x = car.x - 10;
+  G.player.y = car.y;
+  enterCar(G, car);
+  startMission(G, 4);
+  G.mission.timer = 60;
+  G.wanted.stars = 3;
+  G.wanted.lastCrime = G.time;
+  const cop1 = spawnPoliceCar(G);
+  cop1.x = 330;
+  cop1.y = 1140;
+  cop1.angle = 0;
+  cop1.axis = 'h';
+  cop1.road = 1140;
+  cop1.lane = 24;
+  cop1.dir = 1;
+  const cop2 = spawnPoliceCar(G);
+  cop2.x = 280;
+  cop2.y = 1190;
+  cop2.angle = 0;
+  cop2.axis = 'h';
+  cop2.road = 1140;
+  cop2.lane = -24;
+  cop2.dir = 1;
+  // One fast run east down the downtown road: no corners to get wedged in,
+  // the police right behind the whole way.
+  simulate(G, 5, () => driveToward(G, { x: 2500, y: 1140 }));
+  finishStaging(G);
+}
+
+/** On foot in the downtown streets: traffic, pedestrians, the job marker ahead. */
+function stageStreet(G) {
+  G.player.x = 1500;
+  G.player.y = 1000;
+  // The turf job, marker visible, but the crew is not spawned for this shot.
+  G.mission = { index: 3, done: false, stage: 0, timer: 0, hold: 0, killsDone: 0, gangSpawned: true, staged: true };
+  simulate(G, 5, () => {
+    walkToward(G, { x: 1780, y: 820 });
+    G.input.held.fire = false;
+  });
+  finishStaging(G);
+}
+
+/** The turf fight: the player trading shots with Kessler's crew. */
+function stageFight(G) {
+  G.player.x = 1620;
+  G.player.y = 980;
+  startMission(G, 3);
+  G.mission.gangSpawned = false; // updateMission spawns the four on the first step
+  simulate(G, 5, () => {
+    // Aim at the nearest living gang member and fire in bursts.
+    let best = null;
+    let bestD = Infinity;
+    for (const ped of G.peds) {
+      if (!ped.gang || ped.dead) continue;
+      const d = Math.hypot(ped.x - G.player.x, ped.y - G.player.y);
+      if (d < bestD) {
+        bestD = d;
+        best = ped;
+      }
+    }
+    if (best) {
+      G.aimTarget = { x: best.x, y: best.y };
+      G.input.held.fire = G.time % 0.9 < 0.55;
+      // Strafe sideways so the frame has motion in it.
+      G.input.held.left = Math.floor(G.time * 2) % 2 === 0;
+      G.input.held.right = !G.input.held.left;
+    }
+  });
+  finishStaging(G);
+}
+
+/** A fast drive down the beach road, palms and water, one star behind. */
+function stageBeach(G) {
+  const car = makeCar(500, 2420, 0, 6, 'parked');
+  car.color = '#ff7a1a'; // bright orange: unmistakable against the road
+  car.hp = 250; // the hero car survives the staged drive
+  G.cars.push(car);
+  G.player.x = car.x - 10;
+  G.player.y = car.y;
+  enterCar(G, car);
+  startMission(G, 4);
+  G.mission.timer = 55;
+  G.wanted.stars = 1;
+  G.wanted.lastCrime = G.time;
+  const cop = spawnPoliceCar(G);
+  cop.x = 320;
+  cop.y = 2420;
+  cop.angle = 0;
+  cop.axis = 'h';
+  cop.road = 2420;
+  cop.lane = 24;
+  cop.dir = 1;
+  // One fast run east along the beach road; no turn at the end, so the car
+  // never swings off the road into the blocks.
+  simulate(G, 5, () => driveToward(G, { x: 2600, y: 2420 }));
+  finishStaging(G);
 }
 
 /**
- * Stage the named scene on a fresh state and return the screen to draw.
- * Any other name stages the title screen.
+ * Set the game to the named scene (chase, street, fight or beach; anything else
+ * is chase) and leave it frozen on a played frame.
  */
-export function stageShot(name, state) {
-  state.camera = makeCamera();
-  // Centre the camera on the player before the sim runs.
-  state.camera.x = state.player.x - 640;
-  state.camera.y = state.player.y - 360;
-  if (name === 'cover') return stageCover(state);
-  if (name === 'street') return stageStreet(state);
-  if (name === 'mission') return stageMission(state);
-  return 'title';
+export function stageShot(name, G) {
+  G.screen = 'play';
+  if (name === 'street') stageStreet(G);
+  else if (name === 'fight') stageFight(G);
+  else if (name === 'beach') stageBeach(G);
+  else stageChase(G);
 }
